@@ -77,7 +77,7 @@ get_station_weather <- function(station_id) {
           month = col_integer(),
           day   = col_integer(),
           hour  = col_integer(),
-          .default = col_double(),   # grab all numeric cols that exist
+          .default = col_double(),   # grab all numeric cols
           coco  = col_integer()      # cloud-code is integer
         ),
         show_col_types = FALSE
