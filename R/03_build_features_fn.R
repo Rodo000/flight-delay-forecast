@@ -102,14 +102,15 @@ build_features_month <- function(year, month) {
       fx.dep_delay_min,
       (fx.dep_delay_min >= 15) AS late_15
     FROM fx
-    JOIN wx
+    LEFT JOIN wx
       ON wx.station_id = fx.station_id
      AND wx.wx_ts BETWEEN fx.dep_hr_bin - INTERVAL '30' MINUTE
                       AND fx.dep_hr_bin + INTERVAL '30' MINUTE
     QUALIFY
       ROW_NUMBER() OVER (
         PARTITION BY fx.carrier, fx.origin, fx.dest, fx.sched_dep_tstz
-        ORDER BY ABS(date_diff('second', wx.wx_ts, fx.dep_hr_bin))
+        ORDER BY (wx.wx_ts IS NULL) ASC,
+          ABS(date_diff('second', wx.wx_ts, fx.dep_hr_bin))
       ) = 1
   ", as.integer(year), MM))
    
