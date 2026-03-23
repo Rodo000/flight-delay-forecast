@@ -1,0 +1,369 @@
+---
+title: "Flight Delay Forecast | Exploratory Data Analysis"
+author: "Rodolfo Eslava Vázquez"
+date: "2026-02-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The following document presents an Exploratory Data Analysis (EDA) of fifteen months of data used for the flight delay forecast model, covering the period from January 2022 to March 2023. Flight data were obtained from the [Bureau of Transportation Statistics (BTS)](https://www.bts.gov/topics/airlines-airports-and-aviation). Weather data were obtained from [Meteostat](https://meteostat.net/en/). A 15-month window was chosen as flight delays are strongly seasonal. A 12-month window is exactly one seasonal cycle, while the extra 3 months add an extra quarter of data allowing us to validate seasonality, detect early trend signals and keep compute manageable for this stage. 
+
+```{r, message=FALSE, warning=FALSE}
+library(arrow)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(ggrepel)
+library(here)
+
+ds <- open_dataset(here("data", "features"))
+```
+
+### 1. Monthly Coverage
+Let's begin by checking for monthly coverage. 
+```{r}
+month_counts <- ds %>% 
+      mutate(
+            year = year(sched_dep_tstz),
+            month = month(sched_dep_tstz)
+      ) %>% 
+      group_by(year, month) %>% 
+      summarise(n = n(), .groups = "drop") %>% 
+      arrange(year, month) %>% 
+      collect()
+
+month_counts
+```
+
+We observe very consistent coverage of approximately 500k observations across the 15 months in the ingestion window, which is a sign of a stable ingestion. We also observe few instances of data for December 2021 and April 2023. These months were not on the ingestion range and are present likely due to timestamp boundary spillover caused by timezone conversions and shall be dropped from our EDA shortly. Let's do that now.
+```{r}
+ds_eda <- ds %>% 
+      filter(
+            sched_dep_tstz >= as.POSIXct("2022-01-01", tz="UTC"),
+            sched_dep_tstz < as.POSIXct("2023-04-01", tz="UTC")
+      )
+```
+
+### 2. Missing Data
+Now, let's check what percentage of weather data is missing, grouped by month.
+```{r}
+miss_by_month <- ds_eda %>% 
+      mutate(
+            year = year(sched_dep_tstz),
+            month = month(sched_dep_tstz)
+      ) %>% 
+      group_by(year, month) %>% 
+      summarise(
+            carrier_na_pc = mean(is.na(carrier)) * 100,
+            origin_na_pc = mean(is.na(origin)) * 100,
+            dest_na_pct = mean(is.na(dest)) * 100,
+            sched_dep_tstz_na_pct = mean(is.na(sched_dep_tstz)) * 100,
+            dep_hour_local_na_pct = mean(is.na(dep_hour_local)) * 100,
+            dow_na_pct = mean(is.na(dow)) * 100,
+            dwpt_na_pct = mean(is.na(dwpt)) * 100,
+            rhum_na_pct = mean(is.na(rhum)) * 100,
+            prcp_na_pct = mean(is.na(prcp)) * 100,
+            snow_na_pct = mean(is.na(snow)) * 100,
+            wdir_na_pct = mean(is.na(wdir)) * 100,
+            wspd_na_pct = mean(is.na(wspd)) * 100,
+            wpgt_na_pct = mean(is.na(wpgt)) * 100,
+            pres_na_pct = mean(is.na(pres)) * 100,
+            tsun_na_pct = mean(is.na(tsun)) * 100,
+            temp_na_pct = mean(is.na(temp)) * 100,
+            coco_na_pct = mean(is.na(coco)) * 100,
+            dep_delay_min_na_pct = mean(is.na(dep_delay_min)) * 100,
+            late_15_na_pct = mean(is.na(late_15)) * 100,
+
+            .groups = "drop"
+      ) %>% 
+      arrange(year, month) %>% 
+      collect()
+
+miss_by_month
+```
+
+The coverage check provides very useful information. We notice there are 5 columns with great coverage, these being air temperature (`temp`), wind speed (`wspd`), relative humidity (`rhum`), wind direction (`wdir`) and atmospheric pressure (`pres`). Those 5 features consistently have over 97% coverage, which makes them close to ideal features. Four features, however, show 100% missing values, these being dew point (`dwpt`), snowfall (`snow`), wind gusts (`wpgt`) and sunshine duration (`tsun`) are completely missing and will be dropped for the rest of the EDA. The coverage for weather condition code (`coco`) is interesting as it begins low, with around 20% missing values for the first 6 months, then gets a sudden coverage of over 99% starting from July 2022.
+
+```{r}
+vars_drop <- c('dwpt','snow','wpgt','tsun')
+ds_eda %>% 
+   summarise(across(all_of(vars_drop), ~mean(is.na(.))*100)) %>% 
+   collect()
+```
+Checking the variable coverage across the entire window also returns full or close to full coverage missingness, further supporting our decision to drop these variables, let's do that now and take a glimpse at the resulting dataset:
+```{r}
+ds_clean <- ds_eda %>% 
+   select(-all_of(vars_drop))
+glimpse(ds_clean)
+```
+
+### 3. Delay Distribution
+Let's now examine the delay distribution in our dataset using a histogram, filtering out outliers.
+```{r}
+delay_sample <- ds_clean %>% 
+   select(dep_delay_min) %>% 
+   filter(dep_delay_min>=-60, dep_delay_min<=360) %>% #filter out outliers
+   collect()
+
+ggplot(delay_sample, aes(dep_delay_min)) +
+   geom_histogram(binwidth = 5) +
+   labs(x="Departure delay (min)", y="count")
+```
+
+We observe huge spike near zero, suggesting most flights are on-time or only a few minutes off-schedule. Let's log-scale the y-axis to better observe the tail structure.
+```{r}
+ggplot(delay_sample, aes(dep_delay_min)) +
+   geom_histogram(binwidth = 5) +
+   scale_y_log10() +
+   labs(x="Departure delay (min)", y="count")
+```
+
+We observe the departure delay distribution is highly right-skewed with a sharp mode near 0, suggesting one again most flights depart on time or with minor delays. This suggests there exist infrequent but substantial delay disruptions.
+
+Let's now obtain the percentage of flights with delays of more than 60, 120 and 240 minutes.
+```{r}
+tail_stats <- ds_clean %>% 
+   summarise(
+      n=n(),
+      pct_gt_60 = mean(dep_delay_min > 60, na.rm = TRUE) * 100,
+      pct_gt_120 = mean(dep_delay_min > 120, na.rm = TRUE) * 100,
+      pct_gt_240 = mean(dep_delay_min > 240, na.rm = TRUE) * 100,
+      .groups = "drop"
+   ) %>% 
+   collect()
+
+tail_stats
+```
+
+Roughly 7% of the flights are delayed by more than one hour, while delays exceeding two hours are present in about 2.7% of the flights. Longer delays of more than four hours are relatively rare, representing only around 0.7% of all flights. Despite their low frequency, these more extreme delays contribute to the heavy right-skewness potentially having an effect on error metrics. 
+
+### 4. Seasonality 
+Let's now visualize weekly and daily seasonality. We will group the data by departure hour and then by day of week to better distinguish the seasonal effect. We will include only the positive delay times, setting all negative departure times to 0 in order to avoid negative departure times from canceling out actual departure delays. 
+```{r}
+season <- ds_clean %>% 
+   mutate(dep_delay_ps = if_else(dep_delay_min < 0, 0, dep_delay_min)) %>% 
+   group_by(dep_hour_local, dow) %>% 
+   summarise(mean_pos_delay = mean(dep_delay_ps, na.rm=TRUE),
+             n=n(),
+             .groups = "drop") %>% 
+   collect()
+
+ggplot(season, aes(dep_hour_local, mean_pos_delay))+
+   geom_line()+
+   facet_wrap(~dow)+
+   labs(x="Dep hour (local)", y="Mean positive delay")
+```
+
+We observe a clear pattern in the delays. Flights with departures scheduled on the first hours of the day experience lower delays. Flights with departures scheduled between 5-7 AM seem to be the most reliable, with mean delay times around 8-11 minutes. As the day goes on, delays increase. For almost all days, we observe peak delays in the evenings, around 8 PM, with mean delay times of around 22-25 minutes. While flights become more reliable in the morning, during the first few hours of the day (12-2 AM) flight delays remain relatively high, later returning to a low point in delay minutes by 5-7 AM, as noted earlier. This suggests departure time will likely be a strong predictor in our model. 
+
+### 5. Top origins by delay
+Let's visualize which origins have the most delays.
+```{r}
+top_origins <- ds_clean %>% 
+   mutate(delay_pos = if_else(dep_delay_min<0, 0, dep_delay_min)) %>% 
+   group_by(origin) %>% 
+   summarise(
+      n = n(),
+      mean_pos_delay = mean(delay_pos, na.rm = TRUE),
+      late_15_pct = mean(late_15, na.rm = TRUE)*100,
+      .groups = "drop"
+   ) %>% 
+   filter(n >= 5000) %>% 
+   arrange(desc(mean_pos_delay)) %>% 
+   slice_head(n=20) %>% 
+   collect()
+
+top_origins
+```
+Let's visualize this using a scatter plot. We will plot the number of flights (`n`) in the x-axis and the average positive delay (`mean_pos_delay`) on the y-axis. Point size represents the percentage of flight delayed by at least 15 minutes (`late_15_pct`). We will also log-scale the x-axis (number of flights) to better distinguish the structure of low and mid-volume airports, since airport traffic is highly skewed. 
+```{r}
+airport_summary <- ds_clean %>% 
+   mutate(delay_pos = if_else(dep_delay_min<0, 0, dep_delay_min)) %>% 
+   group_by(origin) %>% 
+   summarise(
+      n = n(),
+      mean_pos_delay = mean(delay_pos, na.rm = TRUE),
+      late_15_pct = mean(late_15, na.rm = TRUE)*100,
+      .groups = "drop"
+   ) %>% 
+   filter(n >= 5000) %>% 
+   collect()
+
+top_labels <- airport_summary %>% 
+   arrange(desc(mean_pos_delay)) %>% 
+   slice_head(n=15)
+
+ggplot(airport_summary, aes(x=n, y=mean_pos_delay)) +
+   geom_point(aes(size=late_15_pct))+
+   geom_text_repel(
+      data=top_labels,
+      aes(label=origin),
+      max.overlaps = Inf
+   ) +
+   labs(
+      x = "Number of flights",
+      y = "Mean positive departure delay (min)",
+      size = "% delayed 15+ minutes",
+      title = "Departure delay severity by origin airport"
+   ) +
+   scale_x_log10()
+```
+
+We observe that the airports with the highest mean positive departure delays tend to be lower volume airports. These airports also tend to have relatively larger percentage of flights delayed 15+ minutes. We also observe that there is no clear positive relationship between flight traffic and departure delay.   
+
+### 6. Relationship to weather
+Let's now plot mean delay times against temperature (`temp`), wind speed (`wspd`) and precipitation (`prcp`). 
+```{r}
+temp_delay <- ds_clean %>%
+   mutate(delay_pos = if_else(dep_delay_min < 0, 0, dep_delay_min)) %>% 
+   select(temp, delay_pos) %>% 
+   collect() %>% 
+   mutate(
+      temp_bin = cut(temp, breaks = seq(-50, 50, by=5))
+   ) %>% 
+   group_by(temp_bin) %>% 
+   summarise(
+      mean_pos_delay = mean(delay_pos, na.rm=TRUE),
+      n=n(),
+      .groups = "drop"
+   )
+
+ggplot(temp_delay, aes(x = temp_bin, y=mean_pos_delay)) +
+   geom_col() +
+   labs(
+      x = "Temperature bin (ºC)",
+      y = "Mean positive departure delay (min)",
+      title = "Departure delay vs temperature"
+   ) +
+   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+We observe a clear trend where mean departure delays increase as temperatures fall below ~5 ºC, with the lowest temperatures presenting considerably higher delay times. A similar increase in delays can be observed as temperatures rise, although the effect is not as dramatic. Departure delays seem to be most stable within the 0-20 ºC range. 
+
+Now let's analyze windspeed.
+```{r}
+wind_delay <- ds_clean %>% 
+   mutate(delay_pos = if_else(dep_delay_min < 0, 0, dep_delay_min)) %>% 
+   select(wspd, delay_pos) %>% 
+   collect() %>% 
+   mutate(
+      wspd_bin = cut(wspd, breaks = seq(0, 240, by=10), include.lowest = TRUE)
+   ) %>%
+   group_by(wspd_bin) %>% 
+   summarise(
+      mean_pos_delay = mean(delay_pos, na.rm = TRUE),
+      n = n(),
+      .groups = "drop"
+   )
+
+ggplot(wind_delay, aes(x=wspd_bin, y=mean_pos_delay)) +
+   geom_col() +
+   labs(
+      x = "Wind speed bin (km/h)",
+      y = "Mean positive departure delay (minutes)",
+      title = "Departure delay vs wind speed"
+   ) +
+   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+   
+```
+
+The graph is quite insightful. We observe a clear positive relationship between wind speed and departure delay up until the `(70-80]` bin. Up to this point, higher wind speeds are associated with larger mean departure delays. However, mean positive departure delay falls after that point. Let's analyze the number of observations per bin in an attempt to explain this unintuitive observation:
+
+```{r}
+ds_clean %>% 
+   select(wspd) %>% 
+   collect() %>% 
+   mutate(
+      wspd_bin = cut(wspd, breaks = seq(0, 240, by=10), include.lowest = TRUE)
+   ) %>%
+   group_by(wspd_bin) %>% 
+   summarise(
+      n = n(),
+      .groups = "drop"
+   )
+```
+
+This clarifies the situation. The expected positive relation between departure delay and wind speed is observed up until the `(70,80]` bin, which while it does contain significantly lower observations than previous bins, still has relatively high observations with 229 entries. The following bin, where the trend seems to "reverse", has only 20 observations. This suggests that the trend reversal is likely due to low-sample noise on that bin. Further bins show even lower observations, with just one or two entries per bin in some, and no observations at all in others.
+
+Finally, let's perform the same analysis for precipitation. For this, we will once again plot mean delay times against precipitation bins, followed by the number of observations on each bin. 
+```{r}
+prcp_delay <- ds_clean %>% 
+   mutate(delay_pos = if_else(dep_delay_min < 0, 0, dep_delay_min)) %>% 
+   select(prcp, delay_pos) %>% 
+   collect() %>% 
+   mutate(
+      prcp_bin = cut(prcp, breaks = seq(0, 105, by=5), include.lowest = TRUE)
+   ) %>% 
+   group_by(prcp_bin) %>% 
+   summarise(
+      mean_pos_delay = mean(delay_pos, na.rm = TRUE),
+      n=n(),
+      .groups = "drop"
+   )
+
+ggplot(prcp_delay, aes(x = prcp_bin, y = mean_pos_delay)) +
+   geom_col() +
+   labs(
+      x = "Precipitation (mm)",
+      y = "Mean positive departure delay (minutes)",
+      title = "Departure delay vs precipitation"
+   ) +
+   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r}
+ds_clean %>% 
+   mutate(delay_pos = if_else(dep_delay_min < 0, 0, dep_delay_min)) %>% 
+   select(prcp, delay_pos) %>% 
+   collect() %>% 
+   mutate(
+      prcp_bin = cut(prcp, breaks = seq(0, 105, by=5), include.lowest = TRUE)
+   ) %>% 
+   group_by(prcp_bin) %>% 
+   summarise(
+      n=n(),
+      .groups = "drop"
+   )
+```
+
+Let's also analyze the rain vs no rain binary distribution:
+```{r}
+prcp_delay <- ds_clean %>%
+  mutate(delay_pos = if_else(dep_delay_min < 0, 0, dep_delay_min)) %>%
+  select(prcp, delay_pos) %>%
+  collect() %>%
+  mutate(
+    rain = if_else(prcp > 0, "Rain", "No rain")
+  ) %>%
+  group_by(rain) %>%
+  summarise(
+    mean_pos_delay = mean(delay_pos, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+ggplot(prcp_delay, aes(x = rain, y = mean_pos_delay)) +
+  geom_col() +
+  labs(
+    x = "",
+    y = "Mean positive departure delay (minutes)",
+    title = "Departure delay: rain vs no rain"
+  )
+```
+
+The binary rain graph shows that flights with zero precipitation present a mean positive delay time of about 14 minutes. In contrast, flights with precipitation have a mean positive delay time of about 26 minutes. This suggests precipitation is likely an important predictor of departure delays. 
+
+The binned graph show an inconsistent relation between an increase in precipitation and flight delay times, but once we analyze the bin count we encounter a similar situation as with wind speed, that is, the number of observations falls sharply as precipitation increases, quickly dropping from over one million on the first bin to just a couple of hundred entries by the sixth bin. The first 6 bins appear to suggest a positive relationship between precipitation and delay times, but this trend is broken on the 7th bin, after which the relation becomes inconsistent. Once again, this is likely due to random noise cause by low samples on subsequent bins. 
+
+### 7. Conclusion
+The exploratory analysis reveals stable data coverage across the ingestion window. Some weather-related variables, including air temperature (`temp`), wind speed (`wspd`), relative humidity (`rhum`), wind direction (`wdir`) and atmospheric pressure (`pres`) have low percentage of missing data, with several other variables are unlikely to be useful for modeling due to their high missingness.
+
+The departure delay distribution is highly-right skewed with a sharp mode near zero, indicating most flights depart on time. Clear daily seasonality is also observed, with departures between 5-7 AM being the most reliable, after which delay times steadily increase, peaking around 8 PM. 
+
+We also showed some low-traffic airports present the highest mean departure delays, suggesting delay severity is not solely driven by traffic volume. Additionally, temperatures at the lower and higher ends seem to be associated with increased delays.
+
+Finally, both wind speed and precipitation appear associated with an increase in departure delays, although these trends seem less reliable for more extreme observations on both variables, likely due to low samples. 
+
+These findings suggest both airport and weather variables are likely important predictors of delay times. Some non-linear relations like that of temperature indicate flexible modeling approaches may be needed to address these effects.
